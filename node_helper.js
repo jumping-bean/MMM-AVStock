@@ -21,6 +21,8 @@ module.exports = NodeHelper.create({
         this.config = null;
         this.initial = true;
         this.stocks = {};
+        this.forex ={};
+        this.cryptos = {};
         this.isrunning = false;
     },
 
@@ -49,7 +51,7 @@ module.exports = NodeHelper.create({
     },
 
 
-    prepareAPICalls: function(callArray) {
+    prepareAPICalls: function() {
         var callArray = [];
         var conf = this.config;
         var symbol, func, interval, maPeriod;
@@ -79,6 +81,43 @@ module.exports = NodeHelper.create({
                 }
             }
         }
+        conf.forex.forEach((f,i)=>{
+            func =  (conf.mode == "series") ? conf.chartInterval : "daily";
+            func="forex-"+func;
+            symbol = f;
+            var fromt_o = symbol.match(/(.*)_(.*_)/);
+            var from = from_to[1];
+            var to = from_to[2];
+            this.forex[symbol]= {};
+            idInterval = (func == "forex-intraday") ? conf.intraDayInterval : "";
+            callArray.push({
+                symbol: symbol,
+                from: from,
+                to: to,
+                func: func,
+                interval: idInterval,
+                ma: []
+            });
+            this.forex[symbol][func] = {};
+        });
+        conf.cryptos.forEach((c,i)=>{
+            func =  (conf.mode == "series") ? conf.chartInterval : "daily";
+            func="crypto-"+func;
+            symbol = c;
+            var crypto_market = c.match(/(.*)_(.*)/);
+            var crypto =crypto_market[1];
+            var market =crypto_market[2];
+            this.forex[symbol]= {};
+            idInterval = "";
+            callArray.push({
+                symbol: symbol,
+                crypto: crypto,
+                market: market,
+                func: func,
+                interval: idInterval,
+                ma: []
+            });
+        });
         this.log("API Calls prepared...");
         this.log(callArray);
         this.log(this.stocks);
@@ -124,8 +163,53 @@ module.exports = NodeHelper.create({
     callAPI: function(callItem) {
         var func = callItem.func;
         var interval = callItem.interval;
-        this.log("Calling API: " + func + ", stock: " + callItem.symbol);
-        if (["daily", "weekly", "monthly", "intraday", "quote"].includes(func)) {
+
+        if (callItem.symbol) this.log("Calling API: " + func + ", stock: " + callItem.symbol);
+        if (callItem.from) this.log("Calling API: " + func + ", from: " + callItem.from +", to:"+callItem.to);
+        if (func == "technical") {
+            this.alpha.technical[callItem.ma[0].toLowerCase()](callItem.symbol, callItem.interval, callItem.ma[1], "close")
+            .then(data => {
+                this.processData(data, callItem);
+            });
+        } else if (["forex-daily", "forex-weekly", "forex-monthly","forex-intraday","forex-rate"].includes(func)){
+            func = func.replace("forex-","");
+            if (func == "intraday") {
+                this.alpha.forex[func](callItem.from,callItemn.to, callItem.interval, "compact")
+                .then(data => {
+                    this.processData(data, callItem);
+                })
+                .catch(error => {
+                    console.error("[MMM-AVStock] ERROR: " + JSON.stringify(error));
+                });
+            } else {
+                this.alpha.forex[func](callItem.from,callItem.to)
+                .then(data => {
+                    this.processData(data, callItem);
+                })
+                .catch(error => {
+                    console.error("[MMM-AVStock] ERROR: " + JSON.stringify(error));
+                });
+            }
+        } else if (["crypto-daily", "crypto-weekly", "crypto-monthly","crypto-rate"].includes(func)) {
+            func = func.replace("crypto-","");
+            if (func == "rate"){
+                this.alpha.forex[func](callItem.crypto,callItem.market)
+                .then(data => {
+                    this.processData(data, callItem);
+                })
+                .catch(error => {
+                    console.error("[MMM-AVStock] ERROR: " + JSON.stringify(error));
+                });
+            }else {
+                this.alpha.crypto[func](callItem.crypto,callItem.market)
+                    .then(data => {
+                        this.processData(data, callItem);
+                    })
+                    .catch(error => {
+                        console.error("[MMM-AVStock] ERROR: " + JSON.stringify(error));
+                    });
+            }
+        } else if (["daily", "weekly", "monthly", "intraday", "quote"].includes(func)) {
             if (func == "intraday") {
                 this.alpha.data[func](callItem.symbol, "compact", "json", callItem.interval)
                 .then(data => {
@@ -143,11 +227,6 @@ module.exports = NodeHelper.create({
                     console.error("[MMM-AVStock] ERROR: " + JSON.stringify(error));
                 });
             }
-        } else if (func == "technical") {
-            this.alpha.technical[callItem.ma[0].toLowerCase()](callItem.symbol, callItem.interval, callItem.ma[1], "close")
-            .then(data => {
-                this.processData(data, callItem);
-            });
         }
     },
 
@@ -160,6 +239,54 @@ module.exports = NodeHelper.create({
                 this.log("Global Quote found for " + callItem.symbol);
                 var quote = data[key];
                 this.log(quote);
+                var result = {
+                    symbol: callItem.symbol,
+                    open: parseFloat(quote["02. open"]),
+                    high: parseFloat(quote["03. high"]),
+                    low: parseFloat(quote["04. low"]),
+                    price: parseFloat(quote["05. price"]),
+                    volume: parseInt(quote["06. volume"]),
+                    day: quote["07. latest trading day"],
+                    close: parseFloat(quote["08. previous close"]),
+                    change: parseFloat(quote["09. change"]),
+                    changeP: quote["09. change"]*100/quote["08. previous close"]+'%',
+                    up: (parseFloat(quote["09. change"]) > 0),
+                    requestTime: moment().format(cfg.timeFormat),
+                    hash: callItem.symbol.hashCode()
+                };
+                this.log(result);
+                this.log("Sending socket notification with result: " + JSON.stringify(result));
+                this.sendSocketNotification("UPDATE_QUOTE", {
+                    symbol: callItem.symbol, 
+                    func: callItem.func, 
+                    data: result 
+                });
+            } else if (key.includes("Technical Analysis")) {
+                this.log("Technical analysis data found...");
+                var series = data[key];
+                var dayLimit = (cfg.chartDays > 90) ? 90 : cfg.chartDays;
+                var entries = Object.keys(series).slice(0, dayLimit);
+                var techSeries = [];
+                entries.forEach(entry => {
+                    var item = [
+                        parseInt(moment(entry).format('x')), 
+                        parseFloat(series[entry][callItem.ma[0].toUpperCase()])
+                    ];
+                    techSeries.push(item);
+                });
+                //this.log(techSeries);
+                this.log("Sending Socket Notification...");
+                this.sendSocketNotification("UPDATE_TECH", {
+                    symbol: callItem.symbol, 
+                    func: callItem.ma.join(''),
+                    data: techSeries
+                });
+            } else if (key.includes("Time Series (Digital")){
+
+            } else if (key.includes("Realtime Currency Exchange Rate")){
+                this.log("Realtime Currency Exchange Rate " + callItem.symbol);
+                var rate = data[key];
+                this.log(rate);
                 var result = {
                     symbol: callItem.symbol,
                     open: parseFloat(quote["02. open"]),
@@ -213,27 +340,7 @@ module.exports = NodeHelper.create({
                     func: callItem.func, 
                     data: ts 
                 });
-            } else if (key.includes("Technical Analysis")) {
-                this.log("Technical analysis data found...");
-                var series = data[key];
-                var dayLimit = (cfg.chartDays > 90) ? 90 : cfg.chartDays;
-                var entries = Object.keys(series).slice(0, dayLimit);
-                var techSeries = [];
-                entries.forEach(entry => {
-                    var item = [
-                        parseInt(moment(entry).format('x')), 
-                        parseFloat(series[entry][callItem.ma[0].toUpperCase()])
-                    ];
-                    techSeries.push(item);
-                });
-                //this.log(techSeries);
-                this.log("Sending Socket Notification...");
-                this.sendSocketNotification("UPDATE_TECH", {
-                    symbol: callItem.symbol, 
-                    func: callItem.ma.join(''),
-                    data: techSeries
-                });
-            }
+            } 
         }             
     }, 
     
